@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^npm install html2canvas$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
