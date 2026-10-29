@@ -1,16 +1,12 @@
 import os
 import json
-import re
 from io import BytesIO
-import base64
 
 import requests
-from telegram import Update
 from telegram.ext import (
-    Application, MessageHandler, CommandHandler, filters, ContextTypes
+    Application, MessageHandler, CommandHandler, filters
 )
 from PIL import Image, ImageOps
-from playwright.async_api import async_playwright
 
 # ─── تنظیمات بله ────────────────────────────────
 TOKEN = "451053587:JFrlO7J-1jwlJtvy9n5jffSG1ApRQ6tzSf8"
@@ -19,16 +15,10 @@ FILE_URL = "https://tapi.bale.ai/file/bot"
 
 FRAMES_DIR = "frames"
 STATE_FILE = "state.json"
-TEMPLATE_HTML = "tweet_template.html"
 JPEG_QUALITY = 95
 
-DEFAULT_CONFIG = {
-    "profile_name": "بسیج دانشجویی دانشگاه خواجه نصیر",
-    "handle": "@BorhanKntu",
-    "avatar_url": "https://api.dicebear.com/7.x/identicon/png?seed=kntu",
-    "default_bg_url": "https://picsum.photos/951/727"
-}
 
+# ─── مدیریت state ───────────────────────────
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
@@ -38,158 +28,226 @@ def load_state():
             return {}
     return {}
 
+
 def save_state(state):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
-# ─── ماژول ۱: واترمارک تمام‌صفحه ─────────────────
-def apply_fullscreen_watermark(img: Image.Image, watermark_path: str) -> Image.Image:
+
+# ─── ابزار لیست قالب‌ها / واترمارک‌ها ───────────────
+def list_frames():
+    if not os.path.exists(FRAMES_DIR):
+        return []
+    return sorted(
+        f for f in os.listdir(FRAMES_DIR)
+        if f.lower().endswith(".png")
+    )
+
+
+def frame_name(filename):
+    return os.path.splitext(filename)[0]
+
+
+# ─── اعمال تمام‌صفحه واترمارک روی هر سایز عکس ─────────────
+def apply_fullscreen_watermark(img, watermark_path):
+    """
+    واترمارک را به طور دقیق هم‌اندازه کل سطح عکس تغییر سایز می‌دهد
+    و به صورت تمام‌صفحه روی هر عکسی با هر اندازه و نسبتی اعمال می‌کند.
+    بدون بوم ۴:۳، بدون حاشیه مشکی، و با حفظ ۱۰۰٪ اندازه اصلی عکس.
+    """
+    # تصحیح جهت عکس‌های گرفته‌شده با گوشی موبایل بر اساس متادیتای EXIF
     try:
         img = ImageOps.exif_transpose(img)
     except Exception:
         pass
+
     img = img.convert("RGBA")
     W, H = img.size
-    wm = Image.open(watermark_path).convert("RGBA")
-    wm_resized = wm.resize((W, H), getattr(Image, "Resampling", Image).LANCZOS)
-    return Image.alpha_composite(img, wm_resized)
 
-# ─── ماژول ۲: تولید توییت‌نوشت فیگما ──────────────
-async def render_tweet_card(tweet_text: str, bg_bytes: bytes = None, profile_name: str = None, handle: str = None) -> bytes:
-    with open(TEMPLATE_HTML, "r", encoding="utf-8") as f:
-        html = f.read()
+    # باز کردن فایل واترمارک با شفافیت
+    watermark = Image.open(watermark_path).convert("RGBA")
 
-    # هشتگ‌های آبی‌رنگ
-    escaped = tweet_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    body_html = re.sub(r'(#[\w_\u0600-\u06FF]+)', r'<span class="hashtag">\1</span>', escaped).replace("\n", "<br/>")
+    # تغییر اندازه واترمارک به طول و عرض کامل عکس با بهترین فیلتر کیفیت (LANCZOS)
+    resample_filter = getattr(Image, "Resampling", Image).LANCZOS
+    watermark_resized = watermark.resize((W, H), resample_filter)
 
-    bg_url = DEFAULT_CONFIG["default_bg_url"]
-    if bg_bytes:
-        bg_url = f"data:image/jpeg;base64,{base64.b64encode(bg_bytes).decode('utf-8')}"
+    # ترکیب لایه شفاف واترمارک روی کل سطح عکس به صورت تمام‌صفحه
+    return Image.alpha_composite(img, watermark_resized)
 
-    html = html.replace("{{bg_image_url}}", bg_url)
-    html = html.replace("{{avatar_url}}", DEFAULT_CONFIG["avatar_url"])
-    html = html.replace("{{profile_name}}", profile_name or DEFAULT_CONFIG["profile_name"])
-    html = html.replace("{{handle}}", handle or DEFAULT_CONFIG["handle"])
-    html = html.replace("{{body_html}}", body_html)
-    html = re.sub(r'\{\{#has_media\}\}.*?\{\{/has_media\}\}', '', html, flags=re.DOTALL)
 
-    # رندر با Playwright در ابعاد ۹۵۱ در ۷۲۷
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
-        page = await browser.new_page(viewport={"width": 951, "height": 727})
-        await page.set_content(html, wait_until="networkidle")
-        screenshot = await page.screenshot(type="jpeg", quality=JPEG_QUALITY)
-        await browser.close()
-        return screenshot
-
-# ─── توابع بله ──────────────────────────────────
+# ─── دانلود و ارسال فایل با requests (مخصوص بله) ────
 def bale_get_file_path(file_id):
-    resp = requests.post(f"{BASE_URL}{TOKEN}/getFile", json={"file_id": file_id}, timeout=60).json()
-    return resp["result"]["file_path"]
+    """مسیر فایل را از API بله می‌گیرد."""
+    url = f"{BASE_URL}{TOKEN}/getFile"
+    resp = requests.post(url, json={"file_id": file_id}, timeout=60)
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"getFile failed: {data}")
+    return data["result"]["file_path"]
+
 
 def bale_download_file(file_path):
-    return requests.get(f"{FILE_URL}{TOKEN}/{file_path}", timeout=120).content
+    """فایل را از سرور بله دانلود می‌کند."""
+    url = f"{FILE_URL}{TOKEN}/{file_path}"
+    resp = requests.get(url, timeout=120)
+    resp.raise_for_status()
+    return resp.content
+
 
 def bale_send_photo(chat_id, image_bytes, caption=""):
+    """عکس نهایی را از طریق API بله می‌فرستد."""
+    url = f"{BASE_URL}{TOKEN}/sendPhoto"
     files = {"photo": ("result.jpg", image_bytes, "image/jpeg")}
-    return requests.post(f"{BASE_URL}{TOKEN}/sendPhoto", data={"chat_id": chat_id, "caption": caption}, files=files, timeout=120).json()
+    payload = {"chat_id": chat_id}
+    if caption:
+        payload["caption"] = caption
+    resp = requests.post(url, data=payload, files=files, timeout=120)
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"sendPhoto failed: {data}")
+    return data
 
-# ─── دستورات ربات ───────────────────────────────
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    state = load_state()
-    mode = state.get(chat_id, {}).get("mode", "watermark")
 
-    text = "سلام! 👋 به ربات چندکاره خوش آمدید.\n\n"
-    text += f"📌 **حالت فعلی شما:** `{mode}`\n\n"
-    text += "⚙️ **تغییر حالت کاربری:**\n"
-    text += "• `/mode watermark` → حالت واترمارک تمام‌صفحه روی عکس\n"
-    text += "• `/mode tweet` → حالت تولید کارت توییت (فیگما)\n\n"
-    text += "📝 **ساخت توییت‌نوشت:**\n"
-    text += "کافیست دستور زیر را بزنید:\n"
-    text += "`/tweet متن توییت شما با #هشتگ`\n"
-    text += "یا یک عکس بفرستید و در کپشن آن متن توییت را بنویسید تا پس‌زمینه کارت شود!"
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args or context.args[0].lower() not in ("watermark", "tweet"):
-        await update.message.reply_text("فرمت صحیح: `/mode watermark` یا `/mode tweet`", parse_mode="Markdown")
-        return
-    chosen = context.args[0].lower()
-    state = load_state()
-    chat_id = str(update.effective_chat.id)
-    state.setdefault(chat_id, {})["mode"] = chosen
-    save_state(state)
-    name = "واترمارک تمام‌صفحه" if chosen == "watermark" else "توییت‌نوشت فیگما"
-    await update.message.reply_text(f"✅ حالت ربات به «{name}» تغییر یافت.")
-
-async def cmd_tweet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("متن توییت را وارد کنید. مثال:\n`/tweet متن توییت...`", parse_mode="Markdown")
-        return
-    text = " ".join(context.args)
-    msg = await update.message.reply_text("⏳ در حال طراحی کارت توییت فیگما...")
-    try:
-        card = await render_tweet_card(text)
-        bale_send_photo(update.effective_chat.id, card, caption="✨ کارت توییت آماده شد!")
-    except Exception as e:
-        await update.message.reply_text(f"خطا: {e}")
-    finally:
-        try: await msg.delete()
-        except: pass
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    mode = load_state().get(chat_id, {}).get("mode", "watermark")
-
-    photo = update.message.photo[-1]
-    file_path = bale_get_file_path(photo.file_id)
-    img_bytes = bale_download_file(file_path)
-    caption = update.message.caption or ""
-
-    if mode == "tweet":
-        # اگر در حالت توییت بود، عکس ارسالی پس‌زمینه کارت می‌شود
-        tweet_text = caption if caption else "توییت‌نوشت خودکار"
-        msg = await update.message.reply_text("⏳ در حال رندر کارت توییت با این عکس پس‌زمینه...")
-        try:
-            card = await render_tweet_card(tweet_text, bg_bytes=img_bytes)
-            bale_send_photo(update.effective_chat.id, card, caption="✨ کارت توییت آماده شد!")
-        except Exception as e:
-            await update.message.reply_text(f"خطا: {e}")
-        finally:
-            try: await msg.delete()
-            except: pass
-        return
-
-    # حالت واترمارک:
-    frames = [f for f in os.listdir(FRAMES_DIR) if f.lower().endswith(".png")] if os.path.exists(FRAMES_DIR) else []
+# ─── دستورها ────────────────────────────────
+async def cmd_start(update, context):
+    frames = list_frames()
     if not frames:
-        await update.message.reply_text("هیچ واترمارکی در پوشه frames نیست!")
+        await update.message.reply_text(
+            "هیچ فایل واترمارکی در پوشه frames پیدا نشد.\n"
+            "لطفاً فایل PNG واترمارک را در پوشه frames بگذارید و دوباره اجرا کنید."
+        )
         return
 
-    msg = await update.message.reply_text("⏳ در حال اعمال واترمارک تمام‌صفحه...")
-    try:
-        img = Image.open(BytesIO(img_bytes))
-        result = apply_fullscreen_watermark(img, os.path.join(FRAMES_DIR, frames[0]))
-        out = BytesIO()
-        result.convert("RGB").save(out, format="JPEG", quality=JPEG_QUALITY)
-        out.seek(0)
-        bale_send_photo(update.effective_chat.id, out.read(), caption=f"واترمارک: {frames[0]}")
-    except Exception as e:
-        await update.message.reply_text(f"خطا: {e}")
-    finally:
-        try: await msg.delete()
-        except: pass
+    state = load_state()
+    current = state.get("active_frame")
 
+    text = "سلام 👋\n\nواترمارک‌های موجود:\n"
+    for f in frames:
+        name = frame_name(f)
+        marker = " ✅" if current == f else ""
+        text += f"• /{name}{marker}\n"
+
+    text += "\nهر واترمارکی را بزنید فعال می‌شود. از این پس هر عکسی با هر ابعادی بفرستید، واترمارک به صورت تمام‌صفحه روی کل عکس قرار می‌گیرد."
+    text += "\n\n/current → نمایش واترمارک فعال"
+    await update.message.reply_text(text)
+
+
+async def cmd_current(update, context):
+    state = load_state()
+    current = state.get("active_frame")
+    if not current:
+        await update.message.reply_text("هیچ واترمارکی فعال نیست. /start را بزنید.")
+        return
+    await update.message.reply_text(f"واترمارک فعال: {frame_name(current)}")
+
+
+async def cmd_set_frame(update, context):
+    """وقتی کاربر /اسم‌واترمارک رو می‌زنه، فعالش می‌کنه."""
+    command = update.message.text.split()[0].lstrip("/").lower()
+    frames = list_frames()
+
+    matched = None
+    for f in frames:
+        if frame_name(f).lower() == command:
+            matched = f
+            break
+
+    if not matched:
+        await update.message.reply_text(
+            "چنین واترمارکی وجود ندارد. /start را بزنید تا لیست را ببینید."
+        )
+        return
+
+    state = load_state()
+    state["active_frame"] = matched
+    save_state(state)
+
+    await update.message.reply_text(
+        f"✅ واترمارک «{frame_name(matched)}» فعال شد.\n"
+        f"از این لحظه هر عکسی بفرستید این واترمارک روی کل عکس (تمام‌صفحه) قرار می‌گیرد."
+    )
+
+
+# ─── پردازش عکس دریافتی ─────────────────────────────
+async def handle_photo(update, context):
+    state = load_state()
+    active = state.get("active_frame")
+
+    if not active:
+        available = list_frames()
+        if available:
+            active = available[0]
+            state["active_frame"] = active
+            save_state(state)
+        else:
+            await update.message.reply_text("اول یک واترمارک انتخاب کنید. /start را بزنید.")
+            return
+
+    frame_path = os.path.join(FRAMES_DIR, active)
+    if not os.path.exists(frame_path):
+        await update.message.reply_text("فایل واترمارک فعال پیدا نشد. یک قالب دیگر انتخاب کنید.")
+        return
+
+    msg = await update.message.reply_text("⏳ در حال پردازش واترمارک تمام‌صفحه...")
+
+    try:
+        # ۱. گرفتن بزرگ‌ترین کیفیت عکس ارسالی
+        photo = update.message.photo[-1]
+
+        # ۲. گرفتن مسیر فایل از API بله
+        file_path = bale_get_file_path(photo.file_id)
+
+        # ۳. دانلود فایل از سرور بله
+        img_bytes = bale_download_file(file_path)
+        img = Image.open(BytesIO(img_bytes))
+
+        # ۴. اعمال واترمارک به صورت تمام‌صفحه روی کل ابعاد واقعی عکس
+        result = apply_fullscreen_watermark(img, frame_path)
+
+        # ۵. ذخیره خروجی با بالاترین کیفیت
+        output = BytesIO()
+        result.convert("RGB").save(output, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+        output.seek(0)
+
+        # ۶. ارسال تصویر خروجی به کاربر در بله
+        orig_w, orig_h = img.size
+        bale_send_photo(
+            chat_id=update.effective_chat.id,
+            image_bytes=output.read(),
+            caption=f"واترمارک: {frame_name(active)} ({orig_w}×{orig_h})"
+        )
+
+    except Exception as e:
+        await update.message.reply_text(f"خطا در پردازش تصویر:\n{type(e).__name__}: {e}")
+    finally:
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
+
+# ─── راه‌اندازی ربات ──────────────────────────────
 def main():
-    app = Application.builder().token(TOKEN).base_url(BASE_URL).build()
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .base_url(BASE_URL)
+        .build()
+    )
+
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("mode", cmd_mode))
-    app.add_handler(CommandHandler("tweet", cmd_tweet))
+    app.add_handler(CommandHandler("current", cmd_current))
+    app.add_handler(MessageHandler(
+        filters.TEXT & filters.Regex(r"^/[^/\s]+"),
+        cmd_set_frame
+    ))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    print("ربات چندکاره بله (واترمارک + توییت‌نوشت فیگما) روشن شد.")
+
+    print("ربات واترمارک تمام‌صفحه بله روشن شد. برای خروج Ctrl+C بزنید.")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
