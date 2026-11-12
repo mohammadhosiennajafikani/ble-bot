@@ -1,0 +1,24 @@
+async def cmd_change(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /change command - prompt for new watermark."""
+    user_id = update.effective_user.id
+
+    if user_manager.is_session_expired(user_id):
+        await update.message.reply_text("نشست شما منقضی شده. /start را بزنید.")
+        return
+
+    state = user_manager.get_state(user_id)
+
+    if state == UserState.WATERMARK_READY:
+        await update.message.reply_text(
+            "🔄 برای تغییر واترمارک، فایل PNG جدید را ارسال کنید.\n"
+            "واترمارک قبلی بلافاصله جایگزین خواهد شد."
+        )
+    else:
+        await update.message.reply_text(
+            "شما واترمارک فعالی ندارید. فایل PNG واترمارک خود را ارسال کنید."
+        )
+
+    # Set state to expecting watermark
+    user_manager.set_state(user_id, UserState.WATERMARK_PENDING)
+
+
