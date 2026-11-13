@@ -208,8 +208,8 @@ def validate_logo_image(image_bytes: bytes) -> tuple[Optional[Image.Image], Opti
         width, height = img.size
         if width < 10 or height < 10:
             return None, "ابعاد لوگو خیلی کوچک است (حداقل 10×10 پیکسل)."
-        if width > 2000 or height > 2000:
-            return None, "ابعاد لوگو خیلی بزرگ است (حداکثر 2000×2000 پیکسل)."
+        if width > 4000 or height > 4000:
+            return None, "ابعاد لوگو خیلی بزرگ است (حداکثر 4000×4000 پیکسل)."
 
         # Convert to RGBA for compositing (preserve transparency)
         img = img.convert("RGBA")
@@ -366,7 +366,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_mode_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show mode selection menu."""
     await update.message.reply_text(
-        "سلام! 👋 به ربات پردازش عکس خوش آمدید.\n\n"
+        "سلام! 👋 به ربات مارکیفای خوش آمدید.\n\n"
         "لطفاً حالت مورد نظر خود را انتخاب کنید:\n\n"
         "🔹 **واترمارک (Watermark Mode)**\n"
         "   واترمارک تمام‌صفحه روی عکس‌های شما اعمال می‌شود.\n"
@@ -375,8 +375,8 @@ async def show_mode_selection(update: Update, context: ContextTypes.DEFAULT_TYPE
         "   لوگو کوچک در گوشه یا مرکز عکس قرار می‌گیرد.\n"
         "   مناسب برای برندینگ و واترمارک ظریف.\n\n"
         "📋 برای انتخاب، یکی از دستورات زیر را بزنید:\n"
-        "• `/watermark` — ورود به حالت واترمارک\n"
-        "• `/logo` — ورود به حالت لوگو\n\n"
+        "• /watermark — ورود به حالت واترمارک\n"
+        "• /logo — ورود به حالت لوگو\n\n"
         "🔒 حریم خصوصی:\n"
         "• فایل‌ها فقط در حافظه موقت نگهداری می‌شوند\n"
         "• پس از ۵ دقیقه غیرفعالیتی به صورت خودکار حذف می‌شوند\n"
@@ -1085,7 +1085,10 @@ async def handle_image_processing_logo(update: Update, context: ContextTypes.DEF
 
 # ─── Photo Handler (Watermark Upload) ──────────────────────────
 async def handle_watermark_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle photo upload - treat as watermark if user needs one."""
+    """Handle photo/document upload - treat as watermark if user needs one.
+
+    Supports both photos (compressed) and documents (full quality PNG).
+    """
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
 
@@ -1102,17 +1105,45 @@ async def handle_watermark_upload(update: Update, context: ContextTypes.DEFAULT_
         await handle_image_processing(update, context)
         return
 
-    # Get the highest quality photo
-    photo = update.message.photo[-1]
-    file_id = photo.file_id
+    # Get the file (photo or document)
+    if update.message.photo:
+        logger.debug(f"Watermark upload: received photo for user {user_id}")
+        photo = update.message.photo[-1]
+        file_id = photo.file_id
+        file_size = photo.file_size
+    elif update.message.document:
+        document = update.message.document
+        logger.debug(f"Watermark upload: received document for user {user_id}: mime={document.mime_type}, name={document.file_name}, size={document.file_size}")
+        # Check if it's a PNG
+        mime_type = document.mime_type
+        file_name = document.file_name or ""
+        is_png = (
+            mime_type == "image/png" or
+            file_name.lower().endswith(".png")
+        )
+        if not is_png:
+            await update.message.reply_text(
+                "❌ فرمت فایل واترمارک باید PNG باشد.\n\n"
+                "لطفاً واترمارک خود را به فرمت PNG ارسال کنید.\n"
+                "میتوانید فایل را به صورت عکس یا فایل (Document) بفرستید."
+            )
+            user_manager.increment_errors(user_id)
+            return
+        file_id = document.file_id
+        file_size = document.file_size
+    else:
+        await update.message.reply_text("❌ نوع فایل پشتیبانی نمی‌شود.")
+        return
 
     # Send processing message
     status_msg = await update.message.reply_text("⏳ در حال بررسی واترمارک...")
 
     try:
         # Download file from Bale
+        logger.debug(f"Watermark upload: downloading file {file_id} for user {user_id}")
         file_path = bale_get_file_path(file_id)
         img_bytes = bale_download_file(file_path)
+        logger.debug(f"Watermark upload: downloaded {len(img_bytes)} bytes for user {user_id}")
 
         # Validate file size
         if len(img_bytes) > MAX_FILE_SIZE_MB * 1024 * 1024:
@@ -1121,15 +1152,18 @@ async def handle_watermark_upload(update: Update, context: ContextTypes.DEFAULT_
             return
 
         # Validate as PNG watermark
+        logger.debug(f"Watermark upload: validating image for user {user_id}")
         watermark_img, error = validate_watermark_image(img_bytes)
 
         if error:
+            logger.warning(f"Watermark validation failed for user {user_id}: {error}")
             await status_msg.edit_text(f"❌ {error}")
             user_manager.set_state(user_id, UserState.WATERMARK_INVALID)
             user_manager.increment_errors(user_id)
             return
 
         # Save to temporary storage
+        logger.debug(f"Watermark upload: saving temp file for user {user_id}")
         temp_path = temp_manager.save_uploaded_file(
             user_id, img_bytes, suffix=".png", prefix="watermark_"
         )
@@ -1140,10 +1174,12 @@ async def handle_watermark_upload(update: Update, context: ContextTypes.DEFAULT_
             return
 
         # Store watermark in provider (in-memory)
+        logger.debug(f"Watermark upload: storing in provider for user {user_id}")
         provider = provider_factory.get_provider(user_id)
         await provider.set_watermark(user_id, watermark_img)
 
         # Update user state
+        logger.debug(f"Watermark upload: updating user state for user {user_id}")
         user_manager.set_watermark_info(
             user_id,
             str(temp_path),
@@ -1161,8 +1197,8 @@ async def handle_watermark_upload(update: Update, context: ContextTypes.DEFAULT_
         logger.info(f"User {user_id} set watermark: {watermark_img.size} PNG")
 
     except Exception as e:
-        logger.error(f"Watermark upload error for user {user_id}: {type(e).__name__}: {e}")
-        await status_msg.edit_text(f"❌ خطا در پردازش واترمارک:\n{type(e).__name__}")
+        logger.error(f"Watermark upload error for user {user_id}: {type(e).__name__}: {e}", exc_info=True)
+        await status_msg.edit_text(f"❌ خطا در پردازش واترمارک:\n{type(e).__name__}: {e}")
         user_manager.increment_errors(user_id)
         # Keep error message visible, don't delete
     # On success, keep the success message visible (don't delete)
@@ -1170,7 +1206,7 @@ async def handle_watermark_upload(update: Update, context: ContextTypes.DEFAULT_
 
 # ─── Image Processing Handler ──────────────────────────────────
 async def handle_image_processing(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Process user's image with their watermark."""
+    """Process user's image (sent as photo) with their watermark."""
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
 
@@ -1180,6 +1216,7 @@ async def handle_image_processing(update: Update, context: ContextTypes.DEFAULT_
         return
 
     state = user_manager.get_state(user_id)
+    logger.debug(f"Image processing: user {user_id} state={state.value}")
 
     if state != UserState.WATERMARK_READY:
         await update.message.reply_text(
@@ -1189,11 +1226,13 @@ async def handle_image_processing(update: Update, context: ContextTypes.DEFAULT_
         return
 
     # Get user's watermark from provider
+    logger.debug(f"Image processing: fetching watermark for user {user_id}")
     provider = provider_factory.get_provider(user_id)
     watermark = await provider.get_watermark(user_id)
 
     if watermark is None:
         # Watermark expired or lost
+        logger.warning(f"Image processing: watermark not found/expired for user {user_id}")
         user_manager.clear_watermark(user_id)
         await update.message.reply_text(
             "⚠️ واترمارک شما منقضی شده یا حذف شده.\n"
@@ -1204,13 +1243,17 @@ async def handle_image_processing(update: Update, context: ContextTypes.DEFAULT_
     # Get the highest quality photo
     photo = update.message.photo[-1]
     file_id = photo.file_id
+    file_size = photo.file_size
+    logger.debug(f"Image processing: received photo for user {user_id}, file_id={file_id}, size={file_size}")
 
     status_msg = await update.message.reply_text("⏳ در حال اعمال واترمارک تمام‌صفحه...")
 
     try:
         # Download user's image
+        logger.debug(f"Image processing: downloading file {file_id} for user {user_id}")
         file_path = bale_get_file_path(file_id)
         img_bytes = bale_download_file(file_path)
+        logger.debug(f"Image processing: downloaded {len(img_bytes)} bytes for user {user_id}")
 
         # Validate file size
         if len(img_bytes) > MAX_FILE_SIZE_MB * 1024 * 1024:
@@ -1221,6 +1264,7 @@ async def handle_image_processing(update: Update, context: ContextTypes.DEFAULT_
         # Open image
         img = Image.open(BytesIO(img_bytes))
         orig_w, orig_h = img.size
+        logger.debug(f"Image processing: original image size {orig_w}x{orig_h} for user {user_id}")
 
         # Apply watermark (preserved original algorithm)
         result = apply_fullscreen_watermark(img, watermark)
@@ -1230,6 +1274,7 @@ async def handle_image_processing(update: Update, context: ContextTypes.DEFAULT_
         result.convert("RGB").save(output, format="JPEG", quality=JPEG_QUALITY, optimize=True)
         output.seek(0)
         result_bytes = output.read()
+        logger.debug(f"Image processing: result image {len(result_bytes)} bytes for user {user_id}")
 
         # Send result
         bale_send_photo(
@@ -1244,8 +1289,8 @@ async def handle_image_processing(update: Update, context: ContextTypes.DEFAULT_
         logger.info(f"User {user_id} processed image: {orig_w}×{orig_h}")
 
     except Exception as e:
-        logger.error(f"Image processing error for user {user_id}: {type(e).__name__}: {e}")
-        await status_msg.edit_text(f"❌ خطا در پردازش تصویر:\n{type(e).__name__}")
+        logger.error(f"Image processing error for user {user_id}: {type(e).__name__}: {e}", exc_info=True)
+        await status_msg.edit_text(f"❌ خطا در پردازش تصویر:\n{type(e).__name__}: {e}")
         user_manager.increment_errors(user_id)
         # Keep error message visible, don't delete
     # On success, result is sent as a new photo message; processing message can be deleted
@@ -1266,14 +1311,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if mode == ProcessingMode.LOGO:
         # Logo mode handling
         if state in (UserState.NO_LOGO, UserState.LOGO_PENDING, UserState.LOGO_INVALID):
+            logger.debug(f"Document handler: routing to handle_logo_upload for user {user_id}")
             await handle_logo_upload(update, context)
         elif state == UserState.LOGO_READY:
+            logger.debug(f"Document handler: routing to handle_image_processing_logo for user {user_id}")
             await handle_image_processing_logo(update, context)
         else:
             await update.message.reply_text("\u0648\u0636\u0639\u06cc\u062a \u0646\u0627\u0645\u0639\u062a\u0628\u0631. /start \u0631\u0627 \u0628\u0632\u0646\u06cc\u062f.")
     else:
         # Watermark mode handling (default)
         if state in (UserState.NO_WATERMARK, UserState.WATERMARK_PENDING, UserState.WATERMARK_INVALID):
+            logger.debug(f"Document handler: routing to handle_watermark_upload for user {user_id}")
             await handle_watermark_upload(update, context)
         elif state == UserState.WATERMARK_READY:
             await handle_image_processing(update, context)
@@ -1298,6 +1346,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     document = update.message.document
     mode = user_manager.get_processing_mode(user_id)
     state = user_manager.get_state(user_id)
+
+    logger.debug(f"Document handler: user {user_id}, mode={mode.value if mode else None}, state={state.value if state else None}, mime={document.mime_type}, name={document.file_name}, size={document.file_size}")
 
     # Check if it's a PNG image
     mime_type = document.mime_type
@@ -1330,6 +1380,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 user_manager.increment_errors(user_id)
                 return
+            logger.debug(f"Document handler: routing to handle_logo_upload for user {user_id}")
             await handle_logo_upload(update, context)
         elif state == UserState.LOGO_READY:
             # Processing image with logo - accept any image format
@@ -1340,6 +1391,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 user_manager.increment_errors(user_id)
                 return
+            logger.debug(f"Document handler: routing to handle_image_processing_logo for user {user_id}")
             await handle_image_processing_logo(update, context)
         else:
             await update.message.reply_text("\u0648\u0636\u0639\u06cc\u062a \u0646\u0627\u0645\u0639\u062a\u0628\u0631. /start \u0631\u0627 \u0628\u0632\u0646\u06cc\u062f.")
@@ -1355,6 +1407,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 user_manager.increment_errors(user_id)
                 return
+            logger.debug(f"Document handler: routing to handle_watermark_upload for user {user_id}")
             await handle_watermark_upload(update, context)
         elif state == UserState.WATERMARK_READY:
             # Processing image with watermark - accept any image format
@@ -1365,6 +1418,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 user_manager.increment_errors(user_id)
                 return
+            logger.debug(f"Document handler: routing to handle_image_processing_from_document for user {user_id}")
             await handle_image_processing_from_document(update, context)
         else:
             await update.message.reply_text("\u0648\u0636\u0639\u06cc\u062a \u0646\u0627\u0645\u0639\u062a\u0628\u0631. /start \u0631\u0627 \u0628\u0632\u0646\u06cc\u062f.")
@@ -1379,6 +1433,7 @@ async def handle_image_processing_from_document(update: Update, context: Context
         return
 
     state = user_manager.get_state(user_id)
+    logger.debug(f"Document image processing: user {user_id} state={state.value}")
 
     if state != UserState.WATERMARK_READY:
         await update.message.reply_text(
@@ -1413,11 +1468,13 @@ async def handle_image_processing_from_document(update: Update, context: Context
         return
 
     # Get user's watermark from provider
+    logger.debug(f"Document image processing: fetching watermark for user {user_id}")
     provider = provider_factory.get_provider(user_id)
     watermark = await provider.get_watermark(user_id)
 
     if watermark is None:
         # Watermark expired or lost
+        logger.warning(f"Document image processing: watermark not found/expired for user {user_id}")
         user_manager.clear_watermark(user_id)
         await update.message.reply_text(
             "⚠️ واترمارک شما منقضی شده یا حذف شده.\n"
@@ -1426,16 +1483,20 @@ async def handle_image_processing_from_document(update: Update, context: Context
         return
 
     file_id = document.file_id
+    logger.debug(f"Document image processing: received document for user {user_id}, file_id={file_id}, mime={mime_type}, name={file_name}, size={document.file_size}")
     status_msg = await update.message.reply_text("⏳ در حال اعمال واترمارک تمام‌صفحه...")
 
     try:
         # Download user's image
+        logger.debug(f"Document image processing: downloading file {file_id} for user {user_id}")
         file_path = bale_get_file_path(file_id)
         img_bytes = bale_download_file(file_path)
+        logger.debug(f"Document image processing: downloaded {len(img_bytes)} bytes for user {user_id}")
 
         # Open image
         img = Image.open(BytesIO(img_bytes))
         orig_w, orig_h = img.size
+        logger.debug(f"Document image processing: original image size {orig_w}x{orig_h} for user {user_id}")
 
         # Apply watermark (preserved original algorithm)
         result = apply_fullscreen_watermark(img, watermark)
@@ -1445,6 +1506,7 @@ async def handle_image_processing_from_document(update: Update, context: Context
         result.convert("RGB").save(output, format="JPEG", quality=JPEG_QUALITY, optimize=True)
         output.seek(0)
         result_bytes = output.read()
+        logger.debug(f"Document image processing: result image {len(result_bytes)} bytes for user {user_id}")
 
         # Send result
         bale_send_photo(
@@ -1459,8 +1521,8 @@ async def handle_image_processing_from_document(update: Update, context: Context
         logger.info(f"User {user_id} processed image from document: {orig_w}×{orig_h}")
 
     except Exception as e:
-        logger.error(f"Document image processing error for user {user_id}: {type(e).__name__}: {e}")
-        await status_msg.edit_text(f"❌ خطا در پردازش تصویر:\n{type(e).__name__}")
+        logger.error(f"Document image processing error for user {user_id}: {type(e).__name__}: {e}", exc_info=True)
+        await status_msg.edit_text(f"❌ خطا در پردازش تصویر:\n{type(e).__name__}: {e}")
         user_manager.increment_errors(user_id)
         # Keep error message visible, don't delete
     # On success, result is sent as a new photo message; processing message can be deleted
