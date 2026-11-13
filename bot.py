@@ -1050,12 +1050,16 @@ async def handle_image_processing_logo(update: Update, context: ContextTypes.DEF
         img = Image.open(BytesIO(img_bytes))
         orig_w, orig_h = img.size
 
+        # Convert string values back to enums
+        position = LogoPosition(info['position'])
+        size_preset = LogoSize(info['size_preset'])
+
         # Apply logo overlay
         result = apply_logo_overlay(
             img,
             logo_img,
-            info['position'],
-            info['size_preset']
+            position,
+            size_preset
         )
 
         # Save to bytes
